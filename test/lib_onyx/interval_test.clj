@@ -1,115 +1,172 @@
 (ns lib-onyx.interval-test
-  (:require [clojure.core.async :refer [chan >!! <!! close!]]
-            [onyx.peer.task-lifecycle-extensions :as l-ext]
-            [onyx.peer.pipeline-extensions :as p-ext]
-            [onyx.extensions :as extensions]
-            [onyx.plugin.core-async]
-            [onyx.api]
-            [lib-onyx.interval]))
+  (:require [clojure.core.async :refer [chan >!! <!! close! sliding-buffer]]
+            [midje.sweet :refer :all]
+            [onyx.plugin.core-async :refer [take-segments!]]
+            [onyx.api]))
 
-(defn only-even-numbers [local-state {:keys [n] :as segment}]
-  (Thread/sleep 50)
-  (if (even? n)
-    segment
-    (do (swap! local-state conj segment)
-        [])))
+(def config
+  {:env-config
+   {:zookeeper/address "127.0.0.1:2188"
+    :zookeeper/server? true
+    :zookeeper.server/port 2188}
 
-(defn log-and-purge [{:keys [interval-test/state]}]
-  (prn "State is: " @state)
-  (prn "Flushing local state")
-  (reset! state []))
+   :peer-config
+   {:zookeeper/address "127.0.0.1:2188"
+    :onyx.peer/job-scheduler :onyx.job-scheduler/greedy
+    :onyx.peer/zookeeper-timeout 60000
+    :onyx.messaging/impl :netty
+    :onyx.messaging/peer-port-range [40200 40260]
+    :onyx.messaging/peer-ports [40199]
+    :onyx.messaging/bind-addr "localhost"}
+   :logging {}})
 
-(def workflow
-  [[:in :capitalize-names]
-   [:capitalize-names :out]])
+(def id (java.util.UUID/randomUUID))
 
-(def capacity 1000)
+(def env-config (assoc (:env-config config) :onyx/id id))
 
-(def input-chan (chan capacity))
+(def peer-config (assoc (:peer-config config) :onyx/id id))
 
-(def output-chan (chan capacity))
+(def env (onyx.api/start-env env-config))
 
-(defmethod l-ext/inject-lifecycle-resources :in
-  [_ _] {:core-async/in-chan input-chan})
+(def peer-group (onyx.api/start-peer-group peer-config))
 
-(defmethod l-ext/inject-lifecycle-resources :capitalize-names
-  [_ _]
-  (let [state (atom [])]
-    {:onyx.core/params [state]
-     :interval-test/state state}))
+(def n-messages 100)
 
-(defmethod l-ext/inject-lifecycle-resources :out
-  [_ _] {:core-async/out-chan output-chan})
+(def batch-size 20)
 
-(def batch-size 1)
+(defn my-inc [{:keys [n] :as segment}]
+  (assoc segment :n (inc n)))
+
+(def counter (atom []))
+
+(defn start-task? [event lifecycle]
+  (swap! counter (fn [counter] (conj counter :task-started)))
+  true)
+
+(defn before-task-start [event lifecycle]
+  (swap! counter (fn [counter] (conj counter :task-before)))
+  {})
+
+(defn after-task-stop [event lifecycle]
+  (swap! counter (fn [counter] (conj counter :task-after)))
+  {})
+
+(defn before-batch [event lifecycle]
+  (swap! counter (fn [counter] (conj counter :batch-before)))
+  {})
+
+(defn after-batch [event lifecycle]
+  (swap! counter (fn [counter] (conj counter :batch-after)))
+  {})
 
 (def catalog
   [{:onyx/name :in
     :onyx/ident :core.async/read-from-chan
     :onyx/type :input
     :onyx/medium :core.async
-    :onyx/consumption :sequential
     :onyx/batch-size batch-size
+    :onyx/max-peers 1
     :onyx/doc "Reads segments from a core.async channel"}
 
-   {:onyx/name :capitalize-names
-    :onyx/ident :lib-onyx.interval/recurring-action
-    :onyx/fn :lib-onyx.interval-test/only-even-numbers
+   {:onyx/name :inc
+    :onyx/fn :onyx.peer.lifecycles-test/my-inc
     :onyx/type :function
-    :onyx/consumption :concurrent
-    :lib-onyx.interval/fn :lib-onyx.interval-test/log-and-purge
-    :lib-onyx.interval/ms 300
-    :onyx/batch-size batch-size
-    :onyx/doc "Calls function :lib-onyx.interval/fn every :lib-onyx.interval/ms milliseconds with the pipeline map"}
+    :onyx/batch-size batch-size}
 
    {:onyx/name :out
     :onyx/ident :core.async/write-to-chan
     :onyx/type :output
     :onyx/medium :core.async
-    :onyx/consumption :sequential
     :onyx/batch-size batch-size
+    :onyx/max-peers 1
     :onyx/doc "Writes segments to a core.async channel"}])
 
-(def input-segments
-  (conj (mapv (fn [n] {:n n}) (range 50)) :done))
+(def workflow [[:in :inc]
+               [:inc :out]])
 
-(doseq [segment input-segments]
-  (>!! input-chan segment))
+(def in-chan (chan (inc n-messages)))
 
-(close! input-chan)
+(def out-chan (chan (sliding-buffer (inc n-messages))))
 
-(def id (java.util.UUID/randomUUID))
+(defn inject-in-ch [event lifecycle]
+  {:core.async/chan in-chan})
 
-(def scheduler :onyx.job-scheduler/round-robin)
+(defn inject-out-ch [event lifecycle]
+  {:core.async/chan out-chan})
 
-(def env-config
-  {:hornetq/mode :vm
-   :hornetq.server/type :vm
-   :hornetq/server? true
-   :zookeeper/address "127.0.0.1:2186"
-   :zookeeper/server? true
-   :zookeeper.server/port 2186
-   :onyx/id id
-   :onyx.peer/job-scheduler scheduler})
+(def calls
+  {:lifecycle/start-task? start-task?
+   :lifecycle/before-task-start before-task-start
+   :lifecycle/before-batch before-batch
+   :lifecycle/after-batch after-batch
+   :lifecycle/after-task-stop after-task-stop})
 
-(def peer-config
-  {:hornetq/mode :vm
-   :zookeeper/address "127.0.0.1:2186"
-   :onyx/id id
-   :onyx.peer/job-scheduler scheduler})
+(def in-calls
+  {:lifecycle/before-task-start inject-in-ch})
 
-(def env (onyx.api/start-env env-config))
+(def out-calls
+  {:lifecycle/before-task-start inject-out-ch})
 
-(def v-peers (onyx.api/start-peers! 1 peer-config))
+(def lifecycles
+  [{:lifecycle/task :in
+    :lifecycle/calls :onyx.peer.lifecycles-test/in-calls}
+   {:lifecycle/task :in
+    :lifecycle/calls :onyx.plugin.core-async/reader-calls}
+   {:lifecycle/task :inc
+    :lifecycle/calls :onyx.peer.lifecycles-test/calls
+    :lifecycle/doc "Test lifecycles that increment a counter in an atom"}
+   {:lifecycle/task :out
+    :lifecycle/calls :onyx.peer.lifecycles-test/out-calls}
+   {:lifecycle/task :out
+    :lifecycle/calls :onyx.plugin.core-async/writer-calls}])
 
-(onyx.api/submit-job peer-config
-                     {:catalog catalog :workflow workflow
-                      :task-scheduler :onyx.task-scheduler/round-robin})
+(doseq [n (range n-messages)]
+  (>!! in-chan {:n n}))
 
-(def results (onyx.plugin.core-async/take-segments! output-chan))
+(>!! in-chan :done)
 
+(close! in-chan)
+
+(def v-peers (onyx.api/start-peers 3 peer-group))
+
+(onyx.api/submit-job
+ peer-config
+ {:catalog catalog
+  :workflow workflow
+  :lifecycles lifecycles
+  :task-scheduler :onyx.task-scheduler/balanced})
+
+(def results (take-segments! out-chan))
+
+(let [expected (set (map (fn [x] {:n (inc x)}) (range n-messages)))]
+  (fact (set (butlast results)) => expected)
+  (fact (last results) => :done))
+
+(def expected-order
+  [:task-started
+   :task-before
+   :batch-before
+   :batch-after ; 1
+   :batch-before
+   :batch-after ; 2
+   :batch-before
+   :batch-after ; 3
+   :batch-before
+   :batch-after ; 4
+   :batch-before
+   :batch-after ; 5
+   :batch-before
+   :batch-after
+   :task-after])
+
+
+;; shutdown-peer ensure peers are fully shutdown so that
+;; :task-after will have been set
 (doseq [v-peer v-peers]
   (onyx.api/shutdown-peer v-peer))
 
-(onyx.api/shutdown-env env)
+(fact @counter => expected-order)
 
+(onyx.api/shutdown-peer-group peer-group)
+
+(onyx.api/shutdown-env env)

@@ -20,4 +20,3 @@
         result)
       (do (swap! local-state assoc (get segment key) (dissoc segment key))
           []))))
-

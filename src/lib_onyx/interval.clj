@@ -21,18 +21,17 @@
       (throw (ex-info ":lib-onyx.interval/ms not specified in catalog entry"
                       {:lib-onyx.interval/ms (:lib-onyx.interval/ms t)})))
     (thread
-     (try
-       (loop []
-         (let [[v ch] (alts!! [(timeout (:lib-onyx.interval/ms t)) kill-ch])]
-           (when-not (= ch kill-ch)
-             (f event)
-             (recur))))
-       (catch Exception e
-         (fatal e))))
+      (try
+        (loop []
+          (let [[v ch] (alts!! [(timeout (:lib-onyx.interval/ms t)) kill-ch])]
+            (when-not (= ch kill-ch)
+              (f event)
+              (recur))))
+        (catch Exception e
+          (fatal e))))
     {:lib-onyx.interval/kill-ch kill-ch}))
 
 (defmethod l-ext/close-lifecycle-resources :lib-onyx.interval/recurring-action
   [_ {:keys [lib-onyx.interval/kill-ch] :as event}]
   (close! kill-ch)
   {})
-
